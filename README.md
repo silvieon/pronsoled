@@ -280,4 +280,5 @@ Found a bug? Have a feature request? Open an issue or submit a PR!
 ## Credits
 
 - Built for [Printrun/pronsole](https://github.com/kliment/Printrun) by Kliment
-- Solves a real hardware issue discovered through empirical testing on Ender 3
+- Whoever from Yale University, Berkeley College threw out a whole ass Ender 3
+  v1 in spring move-out 2026 so I could experiment with it
