@@ -1,0 +1,17 @@
+[Unit]
+Description=Pronsoled - Stable Pronsole Daemon for 3D Printer
+After=network.target
+Documentation=https://github.com/YOUR_USERNAME/pronsoled
+
+[Service]
+Type=simple
+User=root
+# Adjust the serial port if needed (e.g., ExecStart=/usr/local/bin/pronsoled /dev/ttyACM0 115200)
+ExecStart=/usr/local/bin/pronsoled
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

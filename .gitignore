@@ -1,0 +1,27 @@
+# Runtime artifacts
+/tmp/
+*.log
+*.pid
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vim/
+
+# Build/distribution (if we ever add Python packaging)
+*.pyc
+__pycache__/
+dist/
+build/
+*.egg-info/
+
+# Shell/bash
+*.sh.bak
+.bash_history
