@@ -53,6 +53,12 @@ sleep 2
 # Check if connection succeeded
 if grep -q "Printer is now online" "$LOG_FILE"; then
     echo "Printer connected successfully"
+
+    echo "Port: '$PORT'\n\
+          Baud: '$BAUD'\n\
+          In:   '$PIPE_IN'\n\
+          Out:  '$LOG_FILE'" > '$PWD/config/config.log'
+
     wait $PRONSOLE_PID
 else
     echo "ERROR: Failed to connect to printer on $PORT"

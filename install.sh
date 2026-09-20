@@ -1,113 +1,69 @@
-#!/bin/bash
+#!/bin/sh
 
-set -e
+set -eu
 
-echo "=== pronsoled installation for Ubuntu Server ==="
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHON_BIN=${PYTHON_BIN:-python3}
 
-# Check if running as sudo (not required but recommended)
-if [ "$EUID" -ne 0 ]; then
-   echo "WARNING: Running without sudo. You may need elevated permissions for some operations."
-   INSTALL_PREFIX="$HOME/.local/bin"
-   mkdir -p "$INSTALL_PREFIX"
+if [ "$(id -u)" -eq 0 ]; then
+    # System install to /usr/local
+    PREFIX="/usr/local"
+    PIP_ARGS="--target $PREFIX"
 else
-   INSTALL_PREFIX="/usr/local/bin"
+    # User install to ~/.local
+    PREFIX="$HOME/.local"
+    PIP_ARGS="--user"
 fi
 
-echo "Install prefix: $INSTALL_PREFIX"
+install_with_pip() {
+    if "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+        $PYTHON_BIN -m pip install --upgrade $PIP_ARGS "$SCRIPT_DIR"
+        return 0
+    fi
+    return 1
+}
 
-# Check dependencies
-echo ""
-echo "Checking dependencies..."
+install_with_venv() {
+    VENV_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pronsoled-install.XXXXXX")"
+    trap 'rm -rf "$VENV_DIR"' EXIT INT TERM
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
+    "$VENV_DIR/bin/python" -m pip install --upgrade pip
+    "$VENV_DIR/bin/python" -m pip install --upgrade "$SCRIPT_DIR"
+    install -Dm755 "$VENV_DIR/bin/pronsoled" "$PREFIX/bin/pronsoled"
+}
 
-if ! command -v pronsole.py &> /dev/null; then
-   echo "ERROR: pronsole.py not found in PATH"
-   echo "Please install Printrun first:"
-   echo "  sudo apt-get install printrun"
-   echo "  or: pip install printrun"
-   exit 1
+if [ "$(id -u)" -eq 0 ]; then
+    INSTALL_MODE="system"
+else
+    INSTALL_MODE="user"
 fi
 
-echo "✓ pronsole.py found"
-
-# Check for bash (should be default on Ubuntu)
-if ! command -v bash &> /dev/null; then
-   echo "ERROR: bash not found (this should not happen on Ubuntu Server)"
-   exit 1
+echo "Installing pronsoled into ${PREFIX} (${INSTALL_MODE} install)..."
+if ! install_with_pip; then
+    echo "pip is unavailable for ${PYTHON_BIN}; falling back to a temporary virtual environment."
+    install_with_venv
 fi
 
-echo "✓ bash found"
-
-# Get script directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Install binaries to PATH
-echo ""
-echo "Installing pronsoled commands to $INSTALL_PREFIX..."
-
-for script in bin/*.sh; do
-   script_name=$(basename "$script" .sh)
-   
-   # Create wrapper that calls the actual script
-   # This ensures PATH resolution works correctly
-   cat > "$INSTALL_PREFIX/pronsoled-$script_name" << EOF
-#!/bin/bash
-exec "$SCRIPT_DIR/bin/$(basename "$script")" "\$@"
-EOF
-   chmod +x "$INSTALL_PREFIX/pronsoled-$script_name"
-   echo "  ✓ pronsoled-$script_name"
-done
-
-# Optional: Create convenience symlinks for common commands
-ln -sf "$INSTALL_PREFIX/pronsoled-start_pronsoled" "$INSTALL_PREFIX/pronsoled" || true
-echo "  ✓ pronsoled (symlink to pronsoled-start_pronsoled)"
-
-# Optionally install systemd service
-echo ""
-echo "Would you like to install a systemd service for auto-start? (y/n)"
-read -r install_service
-
-if [ "$install_service" = "y" ] || [ "$install_service" = "Y" ]; then
-   if [ "$EUID" -ne 0 ]; then
-      echo "ERROR: systemd service installation requires sudo"
-      echo "Please run: sudo bash install.sh"
-      exit 1
-   fi
-   
-   SERVICE_FILE="/etc/systemd/system/pronsoled.service"
-   
-   cat > "$SERVICE_FILE" << 'EOF'
-[Unit]
-Description=Pronsoled - Stable Pronsole Daemon for 3D Printer
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/pronsoled
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
-   
-   chmod 644 "$SERVICE_FILE"
-   systemctl daemon-reload
-   systemctl enable pronsoled.service
-   echo "✓ systemd service installed and enabled"
-   echo "  Start with: sudo systemctl start pronsoled"
-   echo "  Status:     sudo systemctl status pronsoled"
-   echo "  Logs:       sudo journalctl -u pronsoled -f"
+mkdir -p "$PREFIX/bin"
+if [ ! -x "$PREFIX/bin/pronsoled" ]; then
+    echo "ERROR: the pronsoled entry point was not installed at $PREFIX/bin/pronsoled" >&2
+    exit 1
 fi
 
+if [ "${INSTALL_MODE}" = "system" ]; then
+    if [ -f "$SCRIPT_DIR/pronsoled.service" ] && command -v systemctl >/dev/null 2>&1; then
+        install -Dm644 "$SCRIPT_DIR/pronsoled.service" /etc/systemd/system/pronsoled.service
+        systemctl daemon-reload
+        echo "Installed the systemd unit. Enable it with:"
+        echo "  systemctl enable --now pronsoled"
+    fi
+fi
+
+echo "Installed CLI: $PREFIX/bin/pronsoled"
 echo ""
-echo "=== Installation complete ==="
+echo "Usage:"
+echo "  pronsoled /dev/ttyACM0 115200       # Start daemon on specific port"
+echo "  pronsoled auto 115200               # Auto-detect printer port"
+echo "  pronsoled                           # Auto-detect at default 115200 baud"
 echo ""
-echo "Available commands:"
-echo "  pronsoled                     - Start the daemon"
-echo "  pronsoled-send_command        - Send a pronsole command"
-echo "  pronsoled-print_status        - Get printer status"
-echo "  pronsoled-start_print         - Start a print job"
-echo "  pronsoled-abort_print         - Pause the current print"
-echo ""
-echo "For usage, see README.md"
+echo "See README.md for more details."

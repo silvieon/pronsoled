@@ -2,6 +2,8 @@
 /tmp/
 *.log
 *.pid
+config/pronsoled.sock
+config/config
 
 # OS
 .DS_Store

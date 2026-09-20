@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pronsoled"
+version = "0.1.1"
+description = "A persistent local daemon for Printrun's pronsole"
+requires-python = ">=3.10"
+
+[project.scripts]
+pronsoled = "pronsoled.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pronsoled*"]

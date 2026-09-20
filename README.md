@@ -23,10 +23,9 @@ Client N ──┘
 Each client writes to a shared named pipe; pronsole reads commands sequentially. Responses go to a log file that clients can tail.
 
 ## Requirements
-
-- **Ubuntu Server 20.04+** (or any Ubuntu/Debian-based system)
-- **bash** (pre-installed)
-- **Printrun** (specifically `pronsole.py`)
+- Python 3.10+
+- Printrun (specifically `pronsole.py`)
+- A user with access to the printer serial device, usually through the `dialout` group
 - **Standard utilities**: `grep`, `awk`, `mkdir`, `mkfifo`, `wc`, etc. (pre-installed on Ubuntu)
 
 ## Installation
@@ -36,48 +35,28 @@ Each client writes to a shared named pipe; pronsole reads commands sequentially.
 ```bash
 git clone https://github.com/YOUR_USERNAME/pronsoled.git
 cd pronsoled
-sudo bash install.sh
+sudo ./install.sh
 ```
 
 The installer will:
-1. Check for `pronsole.py` in your PATH
-2. Install pronsoled commands to `/usr/local/bin/` (or `~/.local/bin/` if not using sudo)
-3. Optionally set up a systemd service for auto-start
+1. Install the Python package into the selected prefix
+2. Register the `pronsoled` command in the executable path
+3. Install the optional systemd unit when run as root
 
-### Manual Installation
-
-If you prefer to install manually:
+### User install
 
 ```bash
-# Clone the repo
-git clone https://github.com/YOUR_USERNAME/pronsoled.git
 cd pronsoled
-
-# Install commands to PATH
-sudo cp -r bin/* /usr/local/bin/
-# Or for user-only install:
-# mkdir -p ~/.local/bin && cp -r bin/* ~/.local/bin/
-# export PATH="$HOME/.local/bin:$PATH"
-
-# Verify installation
-pronsoled-send_command "M105"  # Should work once daemon is running
+python3 -m pip install --user .
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ### Systemd Service (Optional)
 
-For auto-start on boot:
-
 ```bash
-sudo bash install.sh  # Select 'y' when prompted for systemd service
-```
-
-Or manually:
-
-```bash
-sudo cp pronsoled.service /etc/systemd/system/
+sudo ./install.sh
 sudo systemctl daemon-reload
-sudo systemctl enable pronsoled
-sudo systemctl start pronsoled
+sudo systemctl enable --now pronsoled
 ```
 
 ## Usage
@@ -85,28 +64,22 @@ sudo systemctl start pronsoled
 ### Starting the Daemon
 
 ```bash
-pronsoled              # Default: auto-detect serial port, 115200 baud
-pronsoled /dev/ttyACM0 115200  # Explicit port and baud rate
+pronsoled start                      # Auto-detect one port at 115200 baud
+pronsoled start /dev/ttyACM0 115200 # Explicit port and baud rate
 ```
 
-Once running, the daemon creates:
-- `/tmp/pronsole/commands` — named pipe for incoming commands
-- `/tmp/pronsole/output.log` — log of all responses
+- `./config/config` — selected port, baud, PID, socket, and log paths
+- `pronsoled.sock` — local command socket
+- `pronsoled.log` — pronsole output
 
 ### Sending Commands
 
 ```bash
-# Send a pronsole command
-pronsoled-send_command "M105"  # Get temperature
-
-# Get printer status
-pronsoled-print_status
-
-# Start a print job
-pronsoled-start_print /path/to/file.gcode
-
-# Pause/abort
-pronsoled-abort_print
+pronsoled status
+pronsoled send "M105"      # Get temperature
+pronsoled send "eta"       # Get ETA/status
+pronsoled print /path/to/file.gcode
+pronsoled abort
 ```
 
 Each command returns the last few lines of the daemon's output log.
@@ -114,7 +87,7 @@ Each command returns the last few lines of the daemon's output log.
 ### Example Workflow
 
 ```bash
-# Terminal 1: Start the daemon
+$ pronsoled start
 $ pronsoled
 Starting pronsole daemon
   Input:  /tmp/pronsole/commands
@@ -122,19 +95,19 @@ Starting pronsole daemon
   Port:   /dev/ttyACM0 @ 115200
 Printer connected successfully
 
-# Terminal 2: Send commands
+$ pronsoled status
 $ pronsoled-print_status
 Printer is not currently printing
 > 
 
 $ pronsoled-send_command "M109 S200"
 Setting nozzle temp to 200C...
-
+$ pronsoled print my_model.gcode
 $ pronsoled-start_print my_model.gcode
 Printer idle, starting print...
 Print job started
 
-# Terminal 3: Check status anytime
+$ pronsoled status
 $ pronsoled-print_status
 Printing my_model.gcode
 Estimated time: 45 minutes
@@ -146,8 +119,8 @@ Estimated time: 45 minutes
 
 ```bash
 #!/bin/bash
-# Check if printer is ready before printing
-if pronsoled-print_status | grep -q "not currently printing"; then
+if pronsoled status | grep -q "not currently printing"; then
+    pronsoled print model.gcode
     pronsoled-start_print model.gcode
 else
     echo "Printer busy"
@@ -182,7 +155,7 @@ Any language with subprocess/shell capabilities can call the `pronsoled-*` comma
 
 The daemon isn't running. Start it first:
 
-```bash
+pronsoled start
 pronsoled
 ```
 
