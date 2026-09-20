@@ -6,7 +6,7 @@ A stable daemon wrapper for [pronsole](https://github.com/kliment/Printrun) (Pri
 
 Running multiple instances of pronsole against the same serial port causes intermittent print pauses and serial communication glitches. This happens because each instance competes for exclusive access to the USB serial device, leading to write collisions and dropped packets.
 
-**pronsoled** solves this by maintaining a **single persistent pronsole instance** and routing all commands through it via named pipes. This guarantees:
+**pronsoled** solves this by maintaining a **single persistent pronsole instance** and routing all commands through it via Unix sockets. This guarantees:
 - **One connection per printer** — eliminates serial contention
 - **Stable printing** — no unexpected pauses or glitches
 - **Multiple clients** — different tools/scripts can send commands simultaneously without interfering
@@ -15,18 +15,19 @@ Running multiple instances of pronsole against the same serial port causes inter
 
 ```
 Client 1 ──┐
-           ├──> /tmp/pronsole/commands (named pipe) ──> pronsole daemon ──> /dev/ttyACM0
-Client 2 ──┤                                                              (USB serial)
+           ├──> Unix socket ──> pronsole daemon ──> /dev/ttyACM1
+Client 2 ──┤                    (persistent)       (USB serial)
 Client N ──┘
 ```
 
-Each client writes to a shared named pipe; pronsole reads commands sequentially. Responses go to a log file that clients can tail.
+All clients connect to a single Unix socket; the daemon maintains one pronsole instance. Responses are returned directly over the socket.
 
 ## Requirements
+
 - Python 3.10+
-- Printrun (specifically `pronsole.py`)
-- A user with access to the printer serial device, usually through the `dialout` group
-- **Standard utilities**: `grep`, `awk`, `mkdir`, `mkfifo`, `wc`, etc. (pre-installed on Ubuntu)
+- Printrun (installed via pip)
+- A user with access to the printer serial device (usually through the `dialout` group)
+- systemd (for automatic startup)
 
 ## Installation
 
@@ -39,89 +40,132 @@ sudo ./install.sh
 ```
 
 The installer will:
-1. Install the Python package into the selected prefix
-2. Register the `pronsoled` command in the executable path
-3. Install the optional systemd unit when run as root
+1. Install the Python package to `/usr/local`
+2. Create the `pronsoled` command in `/usr/local/bin/`
+3. Install the systemd service (when run with sudo)
 
-### User install
+### Manual Installation
 
 ```bash
 cd pronsoled
-python3 -m pip install --user .
-export PATH="$HOME/.local/bin:$PATH"
+sudo python3 -m pip install --upgrade --break-system-packages .
 ```
 
-### Systemd Service (Optional)
+## Setup
+
+### 1. Ensure Printrun is Installed
 
 ```bash
-sudo ./install.sh
+sudo python3 -m pip install --upgrade --break-system-packages printrun
+```
+
+### 2. Create Config Directory
+
+```bash
+sudo mkdir -p /var/lib/pronsoled
+sudo mkdir -p /root/.config/Printrun
+```
+
+### 3. Install & Enable Systemd Service
+
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now pronsoled
 ```
 
 ## Usage
 
-### Starting the Daemon
+### Check Daemon Status
 
 ```bash
-pronsoled start                      # Auto-detect one port at 115200 baud
-pronsoled start /dev/ttyACM0 115200 # Explicit port and baud rate
+sudo systemctl status pronsoled
+sudo pronsoled status
 ```
 
-- `./config/config` — selected port, baud, PID, socket, and log paths
-- `pronsoled.sock` — local command socket
-- `pronsoled.log` — pronsole output
-
-### Sending Commands
+### Send Commands to Printer
 
 ```bash
-pronsoled status
-pronsoled send "M105"      # Get temperature
-pronsoled send "eta"       # Get ETA/status
-pronsoled print /path/to/file.gcode
-pronsoled abort
+sudo pronsoled send "M105"       # Get nozzle & bed temperature
+sudo pronsoled send "eta"        # Get print status/ETA
+sudo pronsoled send "M114"       # Get current position
 ```
 
-Each command returns the last few lines of the daemon's output log.
-
-### Example Workflow
+### Start a Print Job
 
 ```bash
-$ pronsoled start
-$ pronsoled
+sudo pronsoled print /path/to/file.gcode
+```
+
+### Abort/Pause Current Print
+
+```bash
+sudo pronsoled abort
+```
+
+### Manual Daemon Control
+
+```bash
+# Start daemon on specific port
+sudo pronsoled start /dev/ttyACM1 115200
+
+# Auto-detect printer port
+sudo pronsoled start auto 115200
+```
+
+## Configuration
+
+The systemd service is configured in `/etc/systemd/system/pronsoled.service`:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/pronsoled start auto 115200
+Environment=PRONSOLED_CONFIG_DIR=/var/lib/pronsoled
+WorkingDirectory=/var/lib/pronsoled
+```
+
+To change the port or baud rate, edit the service file and restart:
+
+```bash
+sudo systemctl edit pronsoled
+sudo systemctl restart pronsoled
+```
+
+## Example Workflow
+
+```bash
+# Start the daemon (if not running via systemd)
+$ sudo pronsoled start auto 115200
 Starting pronsole daemon
   Input:  /tmp/pronsole/commands
   Output: /tmp/pronsole/output.log
-  Port:   /dev/ttyACM0 @ 115200
+  Port:   /dev/ttyACM1 @ 115200
 Printer connected successfully
 
-$ pronsoled status
-$ pronsoled-print_status
-Printer is not currently printing
-> 
+# Check status
+$ sudo pronsoled status
+ttyACM1 22°> Printer is not currently printing. No ETA available.
 
-$ pronsoled-send_command "M109 S200"
+# Heat up nozzle
+$ sudo pronsoled send "M109 S200"
 Setting nozzle temp to 200C...
-$ pronsoled print my_model.gcode
-$ pronsoled-start_print my_model.gcode
-Printer idle, starting print...
+
+# Start a print
+$ sudo pronsoled print model.gcode
 Print job started
 
-$ pronsoled status
-$ pronsoled-print_status
-Printing my_model.gcode
-Estimated time: 45 minutes
+# Check progress
+$ sudo pronsoled status
+ttyACM1 45°> Printing model.gcode - ETA 45 minutes
 ```
 
-## API/Integration
+## Integration
 
 ### From Shell Scripts
 
 ```bash
 #!/bin/bash
-if pronsoled status | grep -q "not currently printing"; then
-    pronsoled print model.gcode
-    pronsoled-start_print model.gcode
+if sudo pronsoled status | grep -q "not currently printing"; then
+    sudo pronsoled print model.gcode
 else
     echo "Printer busy"
 fi
@@ -131,116 +175,76 @@ fi
 
 ```python
 import subprocess
-import time
 
-def send_pronsole_command(cmd):
-    result = subprocess.run(["pronsoled-send_command", cmd], 
+def send_command(cmd):
+    result = subprocess.run(["sudo", "pronsoled", "send", cmd], 
                           capture_output=True, text=True)
-    return result.stdout
+    return result.stdout.strip()
 
-def get_printer_status():
-    return send_pronsole_command("M119").strip()
+def get_status():
+    return send_command("eta")
 
-# Usage
-print(get_printer_status())
+print(get_status())
 ```
-
-### From Other Languages
-
-Any language with subprocess/shell capabilities can call the `pronsoled-*` commands directly.
 
 ## Troubleshooting
 
-### "ERROR: Pronsole daemon not running"
+### "permission denied" on socket
 
-The daemon isn't running. Start it first:
+The daemon is running as root but you're accessing it as a regular user. Either:
+- Use `sudo` for all commands: `sudo pronsoled status`
+- Or run the daemon as your user (not recommended for systemd)
 
-pronsoled start
-pronsoled
-```
+### Daemon won't start
 
-Or check if it's running:
-
-```bash
-ps aux | grep pronsole
-```
-
-### "ERROR: No ttyACM port found"
-
-No USB printer detected. Check:
+Check systemd logs:
 
 ```bash
-ls /dev/ttyACM*
-lsusb  # List USB devices
-dmesg | tail -20  # Check for connection errors
-```
-
-### "ERROR: Multiple ttyACM ports found"
-
-Multiple printers detected. Specify which one:
-
-```bash
-pronsoled /dev/ttyACM0 115200
-```
-
-### "Permission denied" on named pipes
-
-The daemon is running as a different user. Either:
-- Run commands as the same user as the daemon
-- Or run the daemon as root: `sudo pronsoled`
-
-### Systemd service won't start
-
-Check logs:
-
-```bash
-sudo journalctl -u pronsoled -n 50  # Last 50 lines
+sudo journalctl -u pronsoled -n 50
 sudo systemctl status pronsoled
 ```
 
-## Testing
+Common issues:
+- `/root/.config/Printrun` doesn't exist — create it: `sudo mkdir -p /root/.config/Printrun`
+- `/var/lib/pronsoled` doesn't exist — create it: `sudo mkdir -p /var/lib/pronsoled`
+- Printer not connected — verify: `ls /dev/ttyACM*`
 
-Run the test suite:
+### "Printer is not currently printing" but daemon seems stuck
+
+Try restarting:
 
 ```bash
-bash tests/test_pronsoled.sh
+sudo systemctl restart pronsoled
+sleep 2
+sudo pronsoled status
 ```
 
-This requires the daemon to be running and a printer connected. It will:
-1. Verify the daemon creates pipes correctly
-2. Test command sending
-3. Test status queries
-4. Test print start/abort (if test gcode available)
-
-## Development
-
-### Project Structure
+## Project Structure
 
 ```
 pronsoled/
-├── bin/
-│   ├── start_pronsoled.sh         # Main daemon
-│   ├── send_command.sh            # Send command to daemon
-│   ├── print_status.sh            # Get printer status
-│   ├── start_print.sh             # Start a print job
-│   └── abort_print.sh             # Pause/abort
-├── tests/
-│   ├── test_pronsoled.sh          # Test suite
-│   └── test_minimal.gcode         # Minimal test G-code
+├── pronsoled/
+│   ├── cli.py           # Command-line interface
+│   ├── daemon.py        # Daemon server & pronsole wrapper
+│   └── __init__.py
+├── tests/               # Test suite
+├── pyproject.toml       # Python package metadata
+├── pronsoled.service    # systemd unit file
+├── install.sh           # Installation script
 ├── README.md
-├── LICENSE (MIT)
-├── install.sh
-└── .gitignore
+└── LICENSE (MIT)
 ```
 
-### Adding Features
+## Version History
 
-To add a new command, create a script in `bin/` that:
-1. Checks if `/tmp/pronsole/commands` exists
-2. Writes a command to it
-3. Reads from `/tmp/pronsole/output.log` and returns relevant lines
+### v0.1.1
+- Rewrite from bash to Python using asyncio
+- Improved stability with persistent socket connection
+- Fixed systemd service integration
+- Better error handling and logging
 
-The `send_command.sh` script is a good template.
+### v0.1.0
+- Initial bash-based implementation
 
 ## License
 
@@ -252,7 +256,5 @@ Found a bug? Have a feature request? Open an issue or submit a PR!
 
 ## Credits
 
-- Built for [Printrun/pronsole](https://github.com/kliment/Printrun) by Kliment
-- Developed with the help of Claude Haiku 4.5 from Anthropic
-- Whoever from Yale University, Berkeley College threw out a whole ass Ender 3
-  v1 in spring move-out 2026 so I could experiment with it
+- Built for [Printrun/pronsole](https://github.com/kliment/Printrun) by Kliment Yanev
+- Developed with help from Claude (Anthropic)
