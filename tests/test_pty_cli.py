@@ -68,10 +68,12 @@ class PtyIntegrationTest(unittest.TestCase):
             )
             try:
                 socket_path = config_dir / "pronsoled.sock"
-                deadline = time.monotonic() + 5
-                while not socket_path.exists() and time.monotonic() < deadline:
+                deadline = time.monotonic() + 20  # startup self-test takes ~5s
+                while not socket_path.exists() and process.poll() is None and time.monotonic() < deadline:
                     time.sleep(0.05)
-                self.assertTrue(socket_path.exists(), process.stderr.read())
+                if not socket_path.exists():
+                    process.kill()
+                    self.fail(process.communicate()[1])
 
                 def command(*arguments):
                     return subprocess.run(

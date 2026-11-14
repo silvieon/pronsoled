@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -25,9 +26,35 @@ class StartupError(DaemonError):
         super().__init__("; ".join(causes))
 
 
+# Members of the daemon's group may connect; everyone else is refused.
+SOCKET_MODE = 0o660
+
+
+def find_pronsole() -> str:
+    """Locate Printrun's pronsole: next to this interpreter (same venv), then on PATH."""
+    search = os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")])
+    for name in ("pronsole.py", "pronsole"):
+        found = shutil.which(name, path=search)
+        if found:
+            return found
+    return "/usr/local/bin/pronsole.py"
+
+
+def _has_shebang(path: str) -> bool:
+    """True if the file can be executed directly with its own interpreter line."""
+    if not os.access(path, os.X_OK):
+        return False
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return False
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     config_dir: Path
+    log_file: Path | None = None
 
     @property
     def socket(self) -> Path:
@@ -39,7 +66,11 @@ class RuntimePaths:
 
     @property
     def log(self) -> Path:
-        return self.config_dir / "pronsoled.log"
+        return self.log_file or self.config_dir / "pronsoled.log"
+
+    @property
+    def job(self) -> Path:
+        return self.config_dir / "job.gcode"
 
     @property
     def setup(self) -> Path:
@@ -59,9 +90,17 @@ class PronsoleProcess:
         self.command_lock = threading.Lock()
 
     def start(self) -> None:
+        self.paths.log.parent.mkdir(parents=True, exist_ok=True)
         self.log_handle = self.paths.log.open("a", encoding="utf-8", buffering=1)
+        # pronsole expects its config directory to exist.
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        try:
+            (config_home / "Printrun").mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        # Run executables directly so their own shebang (and Python) is used.
         command = [self.executable]
-        if self.executable.endswith(".py"):
+        if self.executable.endswith(".py") and not _has_shebang(self.executable):
             command = [sys.executable, self.executable]
         try:
             self.process = subprocess.Popen(
@@ -200,6 +239,7 @@ class DaemonServer:
             )
             self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.server.bind(str(self.paths.socket))
+            os.chmod(self.paths.socket, SOCKET_MODE)
             self.server.listen(8)
             self.server.settimeout(0.5)
             while not self.stop_event.is_set():
@@ -228,7 +268,7 @@ class DaemonServer:
         if self.server is not None:
             self.server.close()
         self.pronsole.stop()
-        for path in (self.paths.socket, self.paths.pid):
+        for path in (self.paths.socket, self.paths.pid, self.paths.job):
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -236,19 +276,26 @@ class DaemonServer:
 
 
 def send_request(paths: RuntimePaths, command: str) -> list[str]:
-    if not paths.socket.exists():
-        raise DaemonError(
-            f"daemon is not running: socket not found at {paths.socket}. "
-            "Start it with `pronsoled start`."
-        )
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(5)
             connection.connect(str(paths.socket))
             connection.sendall((json.dumps({"command": command}) + "\n").encode())
             response = json.loads(connection.makefile().readline())
+    except (FileNotFoundError, ConnectionRefusedError) as exc:
+        raise DaemonError(
+            f"daemon is not running: no socket at {paths.socket}. "
+            "Start it with `systemctl start pronsoled` or `pronsoled start`."
+        ) from exc
+    except PermissionError as exc:
+        raise DaemonError(
+            f"permission denied on {paths.socket}. Add yourself to the pronsoled group "
+            "(`sudo usermod -aG pronsoled $USER`), then log out and back in."
+        ) from exc
     except OSError as exc:
         raise DaemonError(f"could not contact daemon at {paths.socket}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise DaemonError(f"invalid response from daemon at {paths.socket}") from exc
     if not response.get("ok"):
         raise DaemonError(response.get("error", "daemon rejected the command"))
     return response.get("output", [])

@@ -1,29 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+
 # Runtime artifacts
-/tmp/
 *.log
 *.pid
-config/pronsoled.sock
-config/config
+*.sock
 
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
+# Editors / OS
 .vscode/
 .idea/
 *.swp
-*.swo
 *~
-.vim/
-
-# Build/distribution (if we ever add Python packaging)
-*.pyc
-__pycache__/
-dist/
-build/
-*.egg-info/
-
-# Shell/bash
-*.sh.bak
-.bash_history
+.~lock.*#
+.DS_Store
+Thumbs.db

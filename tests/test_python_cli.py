@@ -1,5 +1,4 @@
 import json
-import os
 import signal
 import subprocess
 import sys
@@ -36,10 +35,13 @@ class PythonCliTest(unittest.TestCase):
             )
             try:
                 socket_path = config_dir / "pronsoled.sock"
-                deadline = time.monotonic() + 5
-                while not socket_path.exists() and time.monotonic() < deadline:
+                deadline = time.monotonic() + 20  # startup self-test takes ~5s
+                while not socket_path.exists() and process.poll() is None and time.monotonic() < deadline:
                     time.sleep(0.05)
-                self.assertTrue(socket_path.exists())
+                if not socket_path.exists():
+                    process.kill()
+                    self.fail(process.communicate()[1])
+                self.assertEqual(socket_path.stat().st_mode & 0o777, 0o660)
 
                 def command(*arguments):
                     return subprocess.run(
