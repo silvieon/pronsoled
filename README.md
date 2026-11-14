@@ -37,6 +37,8 @@ sudo ./install.sh --with-printrun
 sudo systemctl enable --now pronsoled
 ```
 
+`systemctl start` (and `enable --now`) waits until the daemon is connected and its socket is listening, which takes about 5 seconds. If startup fails, for example because no printer is plugged in, it reports the failure. You don't need to run `pronsoled start &` yourself. When startup fails, systemd retries every 10 seconds, so the daemon comes up on its own once you plug the printer in.
+
 Then **log out and back in** (or run `newgrp pronsoled`) so your new group membership takes effect, and use it without `sudo`:
 
 ```bash
@@ -90,7 +92,7 @@ pronsoled start /dev/ttyACM0 115200    # specific port
 pronsoled start auto 115200            # auto-detect a single /dev/ttyACM* port
 ```
 
-When you start it by hand, the daemon runs as you and puts its socket in `$XDG_RUNTIME_DIR/pronsoled`, unless the system service's `/run/pronsoled` exists. Use `--config-dir DIR` or `PRONSOLED_CONFIG_DIR=DIR` to point the daemon and its clients at the same directory.
+When you start it by hand, the daemon runs in the foreground as you and puts its socket in `$XDG_RUNTIME_DIR/pronsoled`. Clients look for the system service's socket first, then for that one. Use `--config-dir DIR` or `PRONSOLED_CONFIG_DIR=DIR` to point the daemon and its clients at a specific directory.
 
 ## Configuration
 
@@ -145,7 +147,7 @@ print(send_command("eta"))
 
 **`permission denied on /run/pronsoled/pronsoled.sock`**: you are not in the `pronsoled` group yet, or you haven't logged in again since being added. Check with `id`. Fix it with `sudo usermod -aG pronsoled $USER`, then log out and back in.
 
-**`daemon is not running`**: check the service:
+**`daemon is not running`**: the service failed to start or is still retrying. Check it:
 
 ```bash
 systemctl status pronsoled
@@ -217,6 +219,12 @@ pronsoled/
 ```
 
 ## Version History
+
+### v0.1.3
+- systemd `Type=notify`: `systemctl start` waits until the socket is ready and reports startup failures
+- `systemctl stop` exits cleanly instead of leaving the unit `failed`
+- Startup fails (and systemd retries) when pronsole cannot connect to the printer, instead of running offline
+- Clients find the system socket even while the service is restarting, and point to `journalctl` when it is down
 
 ### v0.1.2
 - The service runs as an unprivileged `pronsoled` user; the CLI no longer needs `sudo`

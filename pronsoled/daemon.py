@@ -26,8 +26,33 @@ class StartupError(DaemonError):
         super().__init__("; ".join(causes))
 
 
+class Shutdown(Exception):
+    """Raised by the SIGTERM/SIGINT handler to stop the daemon cleanly."""
+
+
 # Members of the daemon's group may connect; everyone else is refused.
 SOCKET_MODE = 0o660
+
+# pronsole output that means `connect` did not reach the printer.
+SYSTEM_UNIT = Path("/etc/systemd/system/pronsoled.service")
+SYSTEM_RUNTIME_DIR = Path("/run/pronsoled")
+
+CONNECT_FAILURES = ("could not connect", "connection error", "not connected")
+
+
+def sd_notify(message: str) -> None:
+    """Tell systemd about our state (Type=notify). No-op outside systemd."""
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify:
+            notify.connect(address)
+            notify.sendall(message.encode())
+    except OSError:
+        pass
 
 
 def find_pronsole() -> str:
@@ -120,7 +145,11 @@ class PronsoleProcess:
 
         self.reader = threading.Thread(target=self._read_output, daemon=True)
         self.reader.start()
-        self.execute(f"connect {self.port} {self.baud}", timeout=3.0)
+        output = "\n".join(self.execute(f"connect {self.port} {self.baud}", timeout=3.0))
+        errors = [line.strip() for line in output.splitlines()
+                  if any(failure in line.lower() for failure in CONNECT_FAILURES)]
+        if errors:
+            raise StartupError([f"could not connect to {self.port}: {' '.join(errors)}"])
 
     def self_test(self) -> dict[str, tuple[bool, str]]:
         probes = {
@@ -242,6 +271,9 @@ class DaemonServer:
             os.chmod(self.paths.socket, SOCKET_MODE)
             self.server.listen(8)
             self.server.settimeout(0.5)
+            # Only now can clients connect: let `systemctl start` return.
+            sd_notify(f"READY=1\nSTATUS=Serving {self.pronsole.port} on {self.paths.socket}")
+            print(f"Ready: listening on {self.paths.socket}", flush=True)
             while not self.stop_event.is_set():
                 try:
                     connection, _ = self.server.accept()
@@ -264,6 +296,7 @@ class DaemonServer:
             connection.sendall((json.dumps(payload) + "\n").encode())
 
     def stop(self) -> None:
+        sd_notify("STOPPING=1")
         self.stop_event.set()
         if self.server is not None:
             self.server.close()
@@ -283,10 +316,14 @@ def send_request(paths: RuntimePaths, command: str) -> list[str]:
             connection.sendall((json.dumps({"command": command}) + "\n").encode())
             response = json.loads(connection.makefile().readline())
     except (FileNotFoundError, ConnectionRefusedError) as exc:
-        raise DaemonError(
-            f"daemon is not running: no socket at {paths.socket}. "
-            "Start it with `systemctl start pronsoled` or `pronsoled start`."
-        ) from exc
+        if SYSTEM_UNIT.exists():
+            hint = (
+                "Start it with `sudo systemctl start pronsoled`; if it keeps failing, "
+                "see `systemctl status pronsoled` and `journalctl -u pronsoled`."
+            )
+        else:
+            hint = "Start it with `pronsoled start` (or `systemctl --user start pronsoled`)."
+        raise DaemonError(f"daemon is not running: no socket at {paths.socket}. {hint}") from exc
     except PermissionError as exc:
         raise DaemonError(
             f"permission denied on {paths.socket}. Add yourself to the pronsoled group "

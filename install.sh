@@ -172,13 +172,15 @@ Description=pronsoled - persistent Printrun pronsole daemon (user)
 Documentation=https://github.com/silvieon/pronsoled
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=60
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$BIN_DIR/pronsoled start auto 115200
 Restart=on-failure
 RestartSec=10
-KillSignal=SIGINT
-TimeoutStopSec=10
+KillMode=mixed
+TimeoutStopSec=15
 
 [Install]
 WantedBy=default.target

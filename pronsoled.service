@@ -4,7 +4,11 @@ Documentation=https://github.com/silvieon/pronsoled
 After=local-fs.target
 
 [Service]
-Type=simple
+# The daemon signals READY only once its socket is listening, so
+# `systemctl start` blocks until `pronsoled status` works (or reports failure).
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=60
 # Unprivileged system user created by install.sh. It is added to the serial
 # group (dialout/uucp) so it can open the printer.
 User=pronsoled
@@ -21,10 +25,12 @@ Environment=HOME=/var/lib/pronsoled
 Environment=PRONSOLED_CONFIG_DIR=/run/pronsoled
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/local/bin/pronsoled start auto 115200 --log-file /var/log/pronsoled/pronsoled.log
+# Keep retrying (e.g. until the printer is plugged in).
 Restart=on-failure
 RestartSec=10
-KillSignal=SIGINT
-TimeoutStopSec=10
+# SIGTERM goes to pronsoled only; it disconnects and stops pronsole itself.
+KillMode=mixed
+TimeoutStopSec=15
 NoNewPrivileges=yes
 ProtectSystem=full
 PrivateTmp=yes
