@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import collections
-import importlib.util
 import json
 import os
 import queue
-import shutil
 import socket
 import subprocess
 import sys
@@ -28,17 +26,10 @@ class StartupError(DaemonError):
         super().__init__("; ".join(causes))
 
 
-class Shutdown(Exception):
-    """Raised by the SIGTERM/SIGINT handler to stop the daemon cleanly."""
-
-
 # Members of the daemon's group may connect; everyone else is refused.
 SOCKET_MODE = 0o660
 
 # pronsole output that means `connect` did not reach the printer.
-SYSTEM_UNIT = Path("/etc/systemd/system/pronsoled.service")
-SYSTEM_RUNTIME_DIR = Path("/run/pronsoled")
-
 CONNECT_FAILURES = ("could not connect", "connection error", "not connected")
 
 
@@ -57,89 +48,13 @@ def sd_notify(message: str) -> None:
         pass
 
 
-def find_pronsole() -> str:
-    """Locate a working Printrun pronsole.
-
-    1. Printrun importable by this interpreter (pip into pronsoled's venv, or the
-       distro's python3 package seen through --system-site-packages): run it
-       through our own launcher.
-    2. Otherwise a pronsole script: `pronsole.py` (pip) or `pronsole` (apt), next to
-       this interpreter or on PATH. Scripts whose Python cannot import printrun,
-       e.g. a stale pip copy shadowing apt's /usr/bin/pronsole, are skipped.
-    """
-    if importlib.util.find_spec("printrun") is not None:
-        return str(Path(__file__).with_name("_pronsole.py"))
-    directories = [str(Path(sys.executable).parent), *os.environ.get("PATH", "").split(os.pathsep), "/usr/bin"]
-    candidates: list[str] = []
-    for directory in directories:
-        for name in ("pronsole.py", "pronsole"):
-            found = shutil.which(name, path=directory)
-            if found and found not in candidates:
-                candidates.append(found)
-    for candidate in candidates:
-        if _imports_printrun(candidate):
-            return candidate
-    # Nothing works; return the first match so `pronsoled check` can show why.
-    return candidates[0] if candidates else "pronsole"
-
-
-def _interpreter(script: str) -> list[str]:
-    """The command a script's shebang names (or ours, if it has none)."""
-    try:
-        with open(script, "rb") as handle:
-            first = handle.readline().decode(errors="replace").strip()
-    except OSError:
-        return [sys.executable]
-    if first.startswith("#!") and "python" in first:
-        return first[2:].split()
-    return [sys.executable]
-
-
-def _imports_printrun(script: str) -> bool:
-    try:
-        result = subprocess.run(
-            [*_interpreter(script), "-c", "import printrun"],
-            capture_output=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
-
-
-def pronsole_command(executable: str) -> list[str]:
-    """Run executables directly so their own shebang (and Python) is used."""
-    if executable.endswith(".py") and not _has_shebang(executable):
+def pronsole_command(executable: str | None) -> list[str]:
+    """Printrun's pronsole through our launcher, or the executable given with --pronsole."""
+    if executable is None:
+        return [sys.executable, "-m", "pronsoled._pronsole"]
+    if executable.endswith(".py"):
         return [sys.executable, executable]
     return [executable]
-
-
-def check_pronsole(executable: str, timeout: float = 60) -> tuple[bool, str]:
-    """Start pronsole as the daemon would, ask it to exit, and report whether that worked."""
-    try:
-        result = subprocess.run(
-            pronsole_command(executable),
-            input="exit\n",
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, str(exc)
-    output = (result.stdout + result.stderr).strip()
-    broken = result.returncode != 0 or "Traceback" in output or "No module named" in output
-    return not broken, output
-
-
-def _has_shebang(path: str) -> bool:
-    """True if the file can be executed directly with its own interpreter line."""
-    if not os.access(path, os.X_OK):
-        return False
-    try:
-        with open(path, "rb") as handle:
-            return handle.read(2) == b"#!"
-    except OSError:
-        return False
 
 
 @dataclass(frozen=True)
@@ -169,11 +84,11 @@ class RuntimePaths:
 
 
 class PronsoleProcess:
-    def __init__(self, paths: RuntimePaths, port: str, baud: int, executable: str):
+    def __init__(self, paths: RuntimePaths, port: str, baud: int, command: list[str]):
         self.paths = paths
         self.port = port
         self.baud = baud
-        self.executable = executable
+        self.command = command
         self.process: subprocess.Popen[str] | None = None
         self.responses: queue.Queue[str] = queue.Queue()
         self.reader: threading.Thread | None = None
@@ -182,20 +97,13 @@ class PronsoleProcess:
         # Last lines pronsole printed, reported if it dies unexpectedly.
         self.tail: collections.deque[str] = collections.deque(maxlen=30)
         self.exited = threading.Event()
-        self.stopping = False
 
     def start(self) -> None:
         self.paths.log.parent.mkdir(parents=True, exist_ok=True)
         self.log_handle = self.paths.log.open("a", encoding="utf-8", buffering=1)
-        # pronsole expects its config directory to exist.
-        config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-        try:
-            (config_home / "Printrun").mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
         try:
             self.process = subprocess.Popen(
-                pronsole_command(self.executable),
+                self.command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -204,17 +112,14 @@ class PronsoleProcess:
             )
         except OSError as exc:
             self.log_handle.close()
-            raise DaemonError(
-                f"could not start {self.executable!r}: {exc}. "
-                "Install Printrun and ensure pronsole.py is on PATH."
-            ) from exc
+            raise DaemonError(f"could not start {' '.join(self.command)}: {exc}") from exc
 
         self.reader = threading.Thread(target=self._read_output, daemon=True)
         self.reader.start()
-        output = "\n".join(self.execute(f"connect {self.port} {self.baud}", timeout=3.0))
+        output = self.execute(f"connect {self.port} {self.baud}", timeout=3.0)
         if self.exited.wait(0.2):
             raise StartupError([self.death_report()])
-        errors = [line.strip() for line in output.splitlines()
+        errors = [line.strip() for line in output
                   if any(failure in line.lower() for failure in CONNECT_FAILURES)]
         if errors:
             raise StartupError([f"could not connect to {self.port}: {' '.join(errors)}"])
@@ -251,15 +156,14 @@ class PronsoleProcess:
         self.exited.set()
 
     def death_report(self) -> str:
-        code = None
-        if self.process is not None:
-            try:
-                code = self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
+        assert self.process is not None
+        try:
+            code = self.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            code = None
         lines = "\n".join(f"    {line}" for line in self.tail) or "    <no output>"
         return (
-            f"pronsole ({self.executable}) exited unexpectedly with code {code}. "
+            f"pronsole exited unexpectedly with code {code}. "
             f"Last output (full log: {self.paths.log}):\n{lines}"
         )
 
@@ -299,7 +203,6 @@ class PronsoleProcess:
             return lines
 
     def stop(self) -> None:
-        self.stopping = True
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             try:
@@ -312,9 +215,9 @@ class PronsoleProcess:
 
 
 class DaemonServer:
-    def __init__(self, paths: RuntimePaths, port: str, baud: int, executable: str):
+    def __init__(self, paths: RuntimePaths, port: str, baud: int, command: list[str]):
         self.paths = paths
-        self.pronsole = PronsoleProcess(paths, port, baud, executable)
+        self.pronsole = PronsoleProcess(paths, port, baud, command)
         self.server: socket.socket | None = None
         self.stop_event = threading.Event()
 
@@ -346,7 +249,7 @@ class DaemonServer:
                     {
                         "port": self.pronsole.port,
                         "baud": self.pronsole.baud,
-                        "pronsole": self.pronsole.executable,
+                        "pronsole": " ".join(self.pronsole.command),
                         "pid": os.getpid(),
                         "socket": str(self.paths.socket),
                         "log": str(self.paths.log),
@@ -362,7 +265,7 @@ class DaemonServer:
             self.server.listen(8)
             self.server.settimeout(0.5)
             # Only now can clients connect: let `systemctl start` return.
-            sd_notify(f"READY=1\nSTATUS=Serving {self.pronsole.port} on {self.paths.socket}")
+            sd_notify("READY=1")
             print(f"Ready: listening on {self.paths.socket}", flush=True)
             while not self.stop_event.is_set():
                 # Without pronsole every request would fail: exit so systemd restarts us.
@@ -389,7 +292,6 @@ class DaemonServer:
             connection.sendall((json.dumps(payload) + "\n").encode())
 
     def stop(self) -> None:
-        sd_notify("STOPPING=1")
         self.stop_event.set()
         if self.server is not None:
             self.server.close()
@@ -409,14 +311,11 @@ def send_request(paths: RuntimePaths, command: str) -> list[str]:
             connection.sendall((json.dumps({"command": command}) + "\n").encode())
             response = json.loads(connection.makefile().readline())
     except (FileNotFoundError, ConnectionRefusedError) as exc:
-        if SYSTEM_UNIT.exists():
-            hint = (
-                "Start it with `sudo systemctl start pronsoled`; if it keeps failing, "
-                "see `systemctl status pronsoled` and `journalctl -u pronsoled`."
-            )
-        else:
-            hint = "Start it with `pronsoled start` (or `systemctl --user start pronsoled`)."
-        raise DaemonError(f"daemon is not running: no socket at {paths.socket}. {hint}") from exc
+        raise DaemonError(
+            f"daemon is not running: no socket at {paths.socket}. Start it with "
+            "`sudo systemctl start pronsoled` (if that fails, see `journalctl -u pronsoled`) "
+            "or by hand with `pronsoled start`."
+        ) from exc
     except PermissionError as exc:
         raise DaemonError(
             f"permission denied on {paths.socket}. Add yourself to the pronsoled group "
