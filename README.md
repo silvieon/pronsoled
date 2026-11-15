@@ -165,7 +165,7 @@ journalctl -u pronsoled -n 50
 If pronsole dies while the daemon is running, the daemon exits, logs pronsole's exit code and last output to the journal, and systemd restarts it.
 
 Common causes:
-- pronsole cannot start (`No module named printrun` and similar). Run `pronsoled check`, then install Printrun as described in [Installing Printrun](#installing-printrun).
+- pronsole cannot start (`No module named printrun` and similar). Run `pronsoled check`, then install Printrun as described in [Installing Printrun](#installing-printrun). A Printrun installed with `pip install --user` lives in that user's `~/.local` and is invisible to the service; `sudo ./install.sh --with-printrun` installs a copy the service can use.
 - No printer is connected, or more than one `/dev/ttyACM*` port exists. Check with `ls /dev/ttyACM*` and set the port explicitly (see [Configuration](#configuration)).
 - pronsole is not installed. Rerun `sudo ./install.sh --with-printrun`.
 - The serial device belongs to a group other than `dialout`. Add the service user to it: `sudo usermod -aG <group> pronsoled`.
@@ -230,6 +230,10 @@ pronsoled/
 ```
 
 ## Version History
+
+### v0.1.5
+- `--with-printrun` now always installs Printrun into the venv. Before, a `pip install --user printrun` in `~/.local` counted as "already installed", but the service user can't see it, which caused `No module named printrun`
+- `pronsoled check` shows where Printrun is imported from
 
 ### v0.1.4
 - Finds apt-installed Printrun (`/usr/bin/pronsole`, or the distro's Python package), and skips stale `pronsole.py` scripts that can't import Printrun

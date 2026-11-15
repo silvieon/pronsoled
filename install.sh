@@ -10,6 +10,12 @@
 #   --uninstall        remove a previous install of the same kind
 set -eu
 
+# A --system-site-packages venv also sees the installing user's ~/.local packages.
+# pip would then treat a `pip install --user printrun` (root's, or yours if sudo
+# keeps HOME) as already installed, and the service user, who cannot see that
+# directory, gets "No module named printrun". Keep ~/.local out of it.
+export PYTHONNOUSERSITE=1
+
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PYTHON_BIN=${PYTHON_BIN:-python3}
 SERVICE_USER=pronsoled
@@ -161,7 +167,7 @@ if [ "$MODE" = system ]; then
         fi
         exit 1
     fi
-    echo "$CHECK" | head -1
+    echo "$CHECK" | head -2
 
     echo ""
     echo "Installed: $BIN_DIR/pronsoled -> $VENV/bin/pronsoled"

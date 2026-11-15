@@ -24,6 +24,7 @@ WorkingDirectory=/var/lib/pronsoled
 Environment=HOME=/var/lib/pronsoled
 Environment=PRONSOLED_CONFIG_DIR=/run/pronsoled
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONNOUSERSITE=1
 ExecStart=/usr/local/bin/pronsoled start auto 115200 --log-file /var/log/pronsoled/pronsoled.log
 # Keep retrying (e.g. until the printer is plugged in).
 Restart=on-failure

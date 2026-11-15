@@ -147,6 +147,12 @@ def run(args: argparse.Namespace) -> int:
         executable = args.pronsole or find_pronsole()
         ok, output = check_pronsole(executable)
         print(f"pronsole: {executable} ({sys.executable})")
+        try:
+            import printrun
+
+            print(f"printrun for this Python: {Path(printrun.__file__).parent}")
+        except Exception as exc:  # report, do not fail: a pronsole script may bring its own
+            print(f"printrun for this Python: not importable ({type(exc).__name__}: {exc})")
         if not ok:
             raise DaemonError(
                 f"pronsole does not start:\n{output}\n"
