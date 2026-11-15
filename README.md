@@ -55,7 +55,14 @@ To give another user access: `sudo usermod -aG pronsoled <user>`.
 
 ### Installing Printrun
 
-`--with-printrun` installs Printrun from PyPI into pronsoled's own virtual environment. Printrun imports wxPython even for pronsole, and PyPI has no Linux wheels for it, so the installer uses your distro's prebuilt package instead (`python3-wxgtk4.0`, installed automatically on Debian/Ubuntu). wxPython only needs to be importable; pronsole runs fine on a headless server. If Printrun is already installed system-wide, leave the flag off. pronsoled first looks for `pronsole.py`/`pronsole` in its own environment, then on `PATH`. You can also pass `--pronsole /path/to/pronsole.py` to `pronsoled start`.
+There are two ways to get Printrun:
+
+- **From your distro**, where it is packaged (Debian, Raspberry Pi OS): `sudo apt install pronsole`, then run `sudo ./install.sh` without the flag. Ubuntu 24.04 does not package it.
+- **`--with-printrun`** installs Printrun from PyPI into pronsoled's own virtual environment. Printrun imports wxPython even for pronsole, and PyPI has no Linux wheels for it, so the installer uses your distro's prebuilt package instead (`python3-wxgtk4.0`, installed automatically on Debian/Ubuntu). wxPython only needs to be importable; pronsole runs fine on a headless server.
+
+pronsoled finds pronsole on its own. It uses Printrun importable from its own environment first, which includes the distro's package. Otherwise it looks for a `pronsole.py` (pip) or `pronsole` (apt) script on `PATH`, skipping any script whose Python can't import Printrun, such as a leftover pip copy. To use a specific one, pass `--pronsole /path/to/pronsole` to `pronsoled start`.
+
+Run `pronsoled check` to see which pronsole will be used and whether it starts. The installer runs this check as the `pronsoled` user and stops with an error if it fails.
 
 ### User install (no root at all)
 
@@ -81,6 +88,7 @@ pronsoled send "M105"              # nozzle & bed temperature
 pronsoled send "M114"              # current position
 pronsoled print /path/to/file.gcode
 pronsoled abort                    # pause the current print
+pronsoled check                    # which pronsole is used, and does it start?
 ```
 
 `pronsoled print` copies the G-code into the daemon's runtime directory before loading it. That lets the daemon print files from your home directory, which its own user cannot read.
@@ -154,7 +162,10 @@ systemctl status pronsoled
 journalctl -u pronsoled -n 50
 ```
 
+If pronsole dies while the daemon is running, the daemon exits, logs pronsole's exit code and last output to the journal, and systemd restarts it.
+
 Common causes:
+- pronsole cannot start (`No module named printrun` and similar). Run `pronsoled check`, then install Printrun as described in [Installing Printrun](#installing-printrun).
 - No printer is connected, or more than one `/dev/ttyACM*` port exists. Check with `ls /dev/ttyACM*` and set the port explicitly (see [Configuration](#configuration)).
 - pronsole is not installed. Rerun `sudo ./install.sh --with-printrun`.
 - The serial device belongs to a group other than `dialout`. Add the service user to it: `sudo usermod -aG <group> pronsoled`.
@@ -219,6 +230,11 @@ pronsoled/
 ```
 
 ## Version History
+
+### v0.1.4
+- Finds apt-installed Printrun (`/usr/bin/pronsole`, or the distro's Python package), and skips stale `pronsole.py` scripts that can't import Printrun
+- New `pronsoled check`; the installer runs it as the service user and fails loudly if pronsole can't start
+- If pronsole dies, the daemon exits with its exit code and last output in the journal, so systemd restarts it, instead of answering "pronsole process is not running" forever
 
 ### v0.1.3
 - systemd `Type=notify`: `systemctl start` waits until the socket is ready and reports startup failures

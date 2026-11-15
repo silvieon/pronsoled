@@ -11,6 +11,9 @@ for line in sys.stdin:
         print("Loaded file", flush=True)
     elif command == "print":
         print("Print job started", flush=True)
+    elif command == "die":
+        print("fake pronsole crashing", flush=True)
+        sys.exit(3)
     elif command == "pause":
         print("Print paused", flush=True)
     else:

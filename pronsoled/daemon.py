@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import collections
+import importlib.util
 import json
 import os
 import queue
@@ -56,13 +58,77 @@ def sd_notify(message: str) -> None:
 
 
 def find_pronsole() -> str:
-    """Locate Printrun's pronsole: next to this interpreter (same venv), then on PATH."""
-    search = os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")])
-    for name in ("pronsole.py", "pronsole"):
-        found = shutil.which(name, path=search)
-        if found:
-            return found
-    return "/usr/local/bin/pronsole.py"
+    """Locate a working Printrun pronsole.
+
+    1. Printrun importable by this interpreter (pip into pronsoled's venv, or the
+       distro's python3 package seen through --system-site-packages): run it
+       through our own launcher.
+    2. Otherwise a pronsole script: `pronsole.py` (pip) or `pronsole` (apt), next to
+       this interpreter or on PATH. Scripts whose Python cannot import printrun,
+       e.g. a stale pip copy shadowing apt's /usr/bin/pronsole, are skipped.
+    """
+    if importlib.util.find_spec("printrun") is not None:
+        return str(Path(__file__).with_name("_pronsole.py"))
+    directories = [str(Path(sys.executable).parent), *os.environ.get("PATH", "").split(os.pathsep), "/usr/bin"]
+    candidates: list[str] = []
+    for directory in directories:
+        for name in ("pronsole.py", "pronsole"):
+            found = shutil.which(name, path=directory)
+            if found and found not in candidates:
+                candidates.append(found)
+    for candidate in candidates:
+        if _imports_printrun(candidate):
+            return candidate
+    # Nothing works; return the first match so `pronsoled check` can show why.
+    return candidates[0] if candidates else "pronsole"
+
+
+def _interpreter(script: str) -> list[str]:
+    """The command a script's shebang names (or ours, if it has none)."""
+    try:
+        with open(script, "rb") as handle:
+            first = handle.readline().decode(errors="replace").strip()
+    except OSError:
+        return [sys.executable]
+    if first.startswith("#!") and "python" in first:
+        return first[2:].split()
+    return [sys.executable]
+
+
+def _imports_printrun(script: str) -> bool:
+    try:
+        result = subprocess.run(
+            [*_interpreter(script), "-c", "import printrun"],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def pronsole_command(executable: str) -> list[str]:
+    """Run executables directly so their own shebang (and Python) is used."""
+    if executable.endswith(".py") and not _has_shebang(executable):
+        return [sys.executable, executable]
+    return [executable]
+
+
+def check_pronsole(executable: str, timeout: float = 60) -> tuple[bool, str]:
+    """Start pronsole as the daemon would, ask it to exit, and report whether that worked."""
+    try:
+        result = subprocess.run(
+            pronsole_command(executable),
+            input="exit\n",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    output = (result.stdout + result.stderr).strip()
+    broken = result.returncode != 0 or "Traceback" in output or "No module named" in output
+    return not broken, output
 
 
 def _has_shebang(path: str) -> bool:
@@ -113,6 +179,10 @@ class PronsoleProcess:
         self.reader: threading.Thread | None = None
         self.log_handle: Any = None
         self.command_lock = threading.Lock()
+        # Last lines pronsole printed, reported if it dies unexpectedly.
+        self.tail: collections.deque[str] = collections.deque(maxlen=30)
+        self.exited = threading.Event()
+        self.stopping = False
 
     def start(self) -> None:
         self.paths.log.parent.mkdir(parents=True, exist_ok=True)
@@ -123,13 +193,9 @@ class PronsoleProcess:
             (config_home / "Printrun").mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-        # Run executables directly so their own shebang (and Python) is used.
-        command = [self.executable]
-        if self.executable.endswith(".py") and not _has_shebang(self.executable):
-            command = [sys.executable, self.executable]
         try:
             self.process = subprocess.Popen(
-                command,
+                pronsole_command(self.executable),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -146,6 +212,8 @@ class PronsoleProcess:
         self.reader = threading.Thread(target=self._read_output, daemon=True)
         self.reader.start()
         output = "\n".join(self.execute(f"connect {self.port} {self.baud}", timeout=3.0))
+        if self.exited.wait(0.2):
+            raise StartupError([self.death_report()])
         errors = [line.strip() for line in output.splitlines()
                   if any(failure in line.lower() for failure in CONNECT_FAILURES)]
         if errors:
@@ -160,6 +228,8 @@ class PronsoleProcess:
         }
         results: dict[str, tuple[bool, str]] = {}
         for name, command in probes.items():
+            if self.exited.is_set():
+                break
             try:
                 time.sleep(1)
                 output = self.execute(command, timeout=3.0)
@@ -176,12 +246,29 @@ class PronsoleProcess:
         assert self.process is not None and self.process.stdout is not None
         for line in self.process.stdout:
             self.log_handle.write(line)
+            self.tail.append(line.rstrip())
             self.responses.put(line.rstrip())
+        self.exited.set()
+
+    def death_report(self) -> str:
+        code = None
+        if self.process is not None:
+            try:
+                code = self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        lines = "\n".join(f"    {line}" for line in self.tail) or "    <no output>"
+        return (
+            f"pronsole ({self.executable}) exited unexpectedly with code {code}. "
+            f"Last output (full log: {self.paths.log}):\n{lines}"
+        )
 
     def execute(self, command: str, timeout: float = 1.0) -> list[str]:
         with self.command_lock:
-            if self.process is None or self.process.poll() is not None:
-                raise DaemonError("the pronsole process is not running")
+            if self.process is None:
+                raise DaemonError("the pronsole process has not been started")
+            if self.process.poll() is not None:
+                raise DaemonError(self.death_report())
             assert self.process.stdin is not None
             while True:
                 try:
@@ -212,6 +299,7 @@ class PronsoleProcess:
             return lines
 
     def stop(self) -> None:
+        self.stopping = True
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             try:
@@ -243,6 +331,8 @@ class DaemonServer:
         try:
             self.pronsole.start()
             self_test = self.pronsole.self_test()
+            if self.pronsole.exited.is_set():
+                raise StartupError([self.pronsole.death_report()])
             print("Startup command self-test:", flush=True)
             for name, (passed, reason) in self_test.items():
                 label = "PASS" if passed else "FAIL"
@@ -275,6 +365,9 @@ class DaemonServer:
             sd_notify(f"READY=1\nSTATUS=Serving {self.pronsole.port} on {self.paths.socket}")
             print(f"Ready: listening on {self.paths.socket}", flush=True)
             while not self.stop_event.is_set():
+                # Without pronsole every request would fail: exit so systemd restarts us.
+                if self.pronsole.exited.is_set():
+                    raise DaemonError(self.pronsole.death_report())
                 try:
                     connection, _ = self.server.accept()
                 except socket.timeout:

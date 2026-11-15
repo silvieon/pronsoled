@@ -119,11 +119,6 @@ if [ "$WITH_PRINTRUN" -eq 1 ]; then
 fi
 ln -sf "$VENV/bin/pronsoled" "$BIN_DIR/pronsoled"
 
-if ! PRONSOLE=$("$VENV/bin/python" -c 'from pronsoled.daemon import find_pronsole; print(find_pronsole())') \
-    || [ ! -e "$PRONSOLE" ]; then
-    echo "WARNING: pronsole was not found. Install Printrun, or rerun with --with-printrun." >&2
-fi
-
 # --- Service ------------------------------------------------------------------
 SERIAL_GROUP=$(serial_group || true)
 
@@ -147,10 +142,26 @@ if [ "$MODE" = system ]; then
         usermod -aG "$SERVICE_USER" "$CLIENT_USER"
     fi
 
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 750 /var/lib/pronsoled
     if have systemctl; then
         install -Dm644 "$SCRIPT_DIR/pronsoled.service" /etc/systemd/system/pronsoled.service
         systemctl daemon-reload
     fi
+
+    # Start pronsole exactly as the service will (same user, HOME and Python).
+    echo "Checking that pronsole starts as the '$SERVICE_USER' user..."
+    if ! CHECK=$(cd /var/lib/pronsoled && runuser -u "$SERVICE_USER" -- \
+            env HOME=/var/lib/pronsoled "$BIN_DIR/pronsoled" check 2>&1); then
+        echo "$CHECK" >&2
+        echo "" >&2
+        if [ "$WITH_PRINTRUN" -eq 0 ]; then
+            echo "ERROR: pronsole is not usable by the service. Rerun: sudo ./install.sh --with-printrun" >&2
+        else
+            echo "ERROR: pronsole is not usable by the service (see above)." >&2
+        fi
+        exit 1
+    fi
+    echo "$CHECK" | head -1
 
     echo ""
     echo "Installed: $BIN_DIR/pronsoled -> $VENV/bin/pronsoled"
@@ -189,6 +200,12 @@ EOF
         UNIT_NOTE="systemctl --user enable --now pronsoled"
     else
         UNIT_NOTE="pronsoled start auto 115200"
+    fi
+
+    if ! CHECK=$("$BIN_DIR/pronsoled" check 2>&1); then
+        echo "$CHECK" >&2
+        echo "ERROR: pronsole does not start. Rerun with --with-printrun (see README)." >&2
+        exit 1
     fi
 
     echo ""

@@ -15,6 +15,7 @@ from .daemon import (
     RuntimePaths,
     Shutdown,
     StartupError,
+    check_pronsole,
     find_pronsole,
     send_request,
 )
@@ -79,6 +80,9 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--pronsole", default=None, help="pronsole executable (default: found on PATH)")
     start.add_argument("--log-file", type=Path, default=None, help="pronsole output log")
 
+    check = subparsers.add_parser("check", help="verify that pronsole can be started")
+    check.add_argument("--pronsole", default=None, help="pronsole executable (default: found on PATH)")
+
     subparsers.add_parser("status", help="ask the printer for its current status")
 
     send = subparsers.add_parser("send", help="send one raw pronsole command")
@@ -137,6 +141,19 @@ def run(args: argparse.Namespace) -> int:
             server.run()
         except Shutdown as exc:
             print(f"pronsoled: stopped ({exc})", flush=True)
+        return 0
+
+    if args.action == "check":
+        executable = args.pronsole or find_pronsole()
+        ok, output = check_pronsole(executable)
+        print(f"pronsole: {executable} ({sys.executable})")
+        if not ok:
+            raise DaemonError(
+                f"pronsole does not start:\n{output}\n"
+                "Install Printrun into pronsoled's environment with `sudo ./install.sh --with-printrun`, "
+                "or pass --pronsole /path/to/pronsole.py."
+            )
+        print("pronsole starts OK")
         return 0
 
     paths = RuntimePaths((args.config_dir or client_config_dir()).expanduser())
