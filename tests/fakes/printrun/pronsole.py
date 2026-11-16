@@ -59,6 +59,7 @@ class pronsole:
         say("[fake] disconnected")
 
     def kill(self) -> None:
+        time.sleep(3)  # the real one waits for its status thread, which sleeps in steps of seconds
         self.statuscheck = False
         if self.status_thread:
             self.status_thread.join()

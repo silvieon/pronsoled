@@ -5,6 +5,7 @@ pronsole never opens a window. Empty stand-ins satisfy those imports, so
 pronsole needs only pyserial and platformdirs (see install.sh).
 """
 import sys
+import traceback
 import types
 
 if __name__ == "__main__":
@@ -20,6 +21,9 @@ if __name__ == "__main__":
     interp.parse_cmdline(sys.argv[1:])
     try:
         interp.cmdloop()
+    except Exception:
+        traceback.print_exc()  # now: the cleanup below can take seconds, and clients wait for this
+        sys.exit(1)
     finally:
         interp.p.disconnect()
         interp.kill()  # stops pronsole's status thread, which would keep a dead pronsole running
