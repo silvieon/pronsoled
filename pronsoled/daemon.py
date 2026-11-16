@@ -1,6 +1,10 @@
+"""The daemon, which shares one pronsole process through a Unix socket, and the client call.
+
+Protocol: a client sends one JSON line, {"command": "<pronsole command>"}, and gets
+one back: {"ok": true, "output": [lines]} or {"ok": false, "error": "<reason>"}.
+"""
 from __future__ import annotations
 
-import collections
 import json
 import os
 import queue
@@ -9,322 +13,182 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+
+SOCKET = "pronsoled.sock"
+ONLINE_TIMEOUT = 30  # seconds the printer gets to answer after `connect`
 
 
 class DaemonError(RuntimeError):
-    """An expected daemon or printer error."""
+    """An expected failure, reported to the user without a traceback."""
 
 
-class StartupError(DaemonError):
-    """One or more startup checks failed."""
+class Pronsole:
+    """A pronsole child process. Everything it prints is echoed to our stdout, the log."""
 
-    def __init__(self, causes: list[str]):
-        self.causes = causes
-        super().__init__("; ".join(causes))
-
-
-# Members of the daemon's group may connect; everyone else is refused.
-SOCKET_MODE = 0o660
-
-# pronsole output that means `connect` did not reach the printer.
-CONNECT_FAILURES = ("could not connect", "connection error", "not connected")
-
-
-def sd_notify(message: str) -> None:
-    """Tell systemd about our state (Type=notify). No-op outside systemd."""
-    address = os.environ.get("NOTIFY_SOCKET")
-    if not address:
-        return
-    if address.startswith("@"):
-        address = "\0" + address[1:]
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify:
-            notify.connect(address)
-            notify.sendall(message.encode())
-    except OSError:
-        pass
-
-
-def pronsole_command(executable: str | None) -> list[str]:
-    """Printrun's pronsole through our launcher, or the executable given with --pronsole."""
-    if executable is None:
-        return [sys.executable, "-m", "pronsoled._pronsole"]
-    if executable.endswith(".py"):
-        return [sys.executable, executable]
-    return [executable]
-
-
-@dataclass(frozen=True)
-class RuntimePaths:
-    config_dir: Path
-    log_file: Path | None = None
-
-    @property
-    def socket(self) -> Path:
-        return self.config_dir / "pronsoled.sock"
-
-    @property
-    def pid(self) -> Path:
-        return self.config_dir / "pronsoled.pid"
-
-    @property
-    def log(self) -> Path:
-        return self.log_file or self.config_dir / "pronsoled.log"
-
-    @property
-    def job(self) -> Path:
-        return self.config_dir / "job.gcode"
-
-    @property
-    def setup(self) -> Path:
-        return self.config_dir / "config"
-
-
-class PronsoleProcess:
-    def __init__(self, paths: RuntimePaths, port: str, baud: int, command: list[str]):
-        self.paths = paths
-        self.port = port
-        self.baud = baud
-        self.command = command
-        self.process: subprocess.Popen[str] | None = None
-        self.responses: queue.Queue[str] = queue.Queue()
-        self.reader: threading.Thread | None = None
-        self.log_handle: Any = None
-        self.command_lock = threading.Lock()
-        # Last lines pronsole printed, reported if it dies unexpectedly.
-        self.tail: collections.deque[str] = collections.deque(maxlen=30)
-        self.exited = threading.Event()
-
-    def start(self) -> None:
-        self.paths.log.parent.mkdir(parents=True, exist_ok=True)
-        self.log_handle = self.paths.log.open("a", encoding="utf-8", buffering=1)
-        try:
-            self.process = subprocess.Popen(
-                self.command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-        except OSError as exc:
-            self.log_handle.close()
-            raise DaemonError(f"could not start {' '.join(self.command)}: {exc}") from exc
-
-        self.reader = threading.Thread(target=self._read_output, daemon=True)
-        self.reader.start()
-        output = self.execute(f"connect {self.port} {self.baud}", timeout=3.0)
-        if self.exited.wait(0.2):
-            raise StartupError([self.death_report()])
-        errors = [line.strip() for line in output
-                  if any(failure in line.lower() for failure in CONNECT_FAILURES)]
-        if errors:
-            raise StartupError([f"could not connect to {self.port}: {' '.join(errors)}"])
-
-    def self_test(self) -> dict[str, tuple[bool, str]]:
-        probes = {
-            "status": "eta",
-            "send": "M105",
-            "print": "help print",
-            "abort": "help pause",
-        }
-        results: dict[str, tuple[bool, str]] = {}
-        for name, command in probes.items():
-            if self.exited.is_set():
-                break
-            try:
-                time.sleep(1)
-                output = self.execute(command, timeout=3.0)
-            except DaemonError as exc:
-                results[name] = (False, str(exc))
-                continue
-            if output and any(line.strip() for line in output):
-                results[name] = (True, f"{command} responded")
-            else:
-                results[name] = (False, f"no response to {command!r}")
-        return results
-
-    def _read_output(self) -> None:
-        assert self.process is not None and self.process.stdout is not None
-        for line in self.process.stdout:
-            self.log_handle.write(line)
-            self.tail.append(line.rstrip())
-            self.responses.put(line.rstrip())
-        self.exited.set()
-
-    def death_report(self) -> str:
-        assert self.process is not None
-        try:
-            code = self.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            code = None
-        lines = "\n".join(f"    {line}" for line in self.tail) or "    <no output>"
-        return (
-            f"pronsole exited unexpectedly with code {code}. "
-            f"Last output (full log: {self.paths.log}):\n{lines}"
+    def __init__(self) -> None:
+        self.process = subprocess.Popen(
+            [sys.executable, "-u", str(Path(__file__).with_name("_pronsole.py"))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            encoding="utf-8", errors="replace",
         )
+        self.lines: queue.Queue[str] = queue.Queue()
+        self.lost = ""  # what pronsole said when the printer went away
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
 
-    def execute(self, command: str, timeout: float = 1.0) -> list[str]:
-        with self.command_lock:
-            if self.process is None:
-                raise DaemonError("the pronsole process has not been started")
-            if self.process.poll() is not None:
-                raise DaemonError(self.death_report())
-            assert self.process.stdin is not None
-            while True:
-                try:
-                    self.responses.get_nowait()
-                except queue.Empty:
-                    break
+    def _read(self) -> None:
+        for line in self.process.stdout:
+            line = line.rstrip()
+            if line:  # pronsole starts printer messages with \r, which reads as an empty line
+                print(line, flush=True)
+                self.lines.put(line)
+            if "(disconnected?)" in line:
+                self.lost = line
+
+    def check(self) -> None:
+        """Raise if pronsole has exited or lost the printer: it does not reconnect by itself.
+
+        The reader thread ends when pronsole does, once all its output is echoed.
+        """
+        if not self.reader.is_alive():
+            raise DaemonError(f"pronsole exited unexpectedly with code {self.process.wait()}")
+        if self.lost:
+            raise DaemonError(f"lost the printer: {self.lost}")
+
+    def send(self, command: str) -> None:
+        try:
+            self.process.stdin.write(command + "\n")
+            self.process.stdin.flush()
+        except OSError as exc:
+            raise DaemonError("pronsole is not running") from exc
+
+    def connect(self, port: str, baud: int) -> None:
+        """Connect to the printer and wait until it is online."""
+        self.send(f"connect {port} {baud}")
+        deadline = time.monotonic() + ONLINE_TIMEOUT
+        while time.monotonic() < deadline:
+            self.check()
             try:
-                self.process.stdin.write(command.rstrip("\n") + "\n")
-                self.process.stdin.flush()
-            except OSError as exc:
-                raise DaemonError(f"could not send command {command!r}: {exc}") from exc
+                line = self.lines.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if "Printer is now online" in line:
+                return
+            if "Connection error" in line:
+                raise DaemonError(line)
+        raise DaemonError(f"the printer on {port} did not come online within {ONLINE_TIMEOUT} seconds")
 
-            lines: list[str] = []
-            deadline = time.monotonic() + timeout
-            quiet_deadline: float | None = None
+    def execute(self, command: str) -> list[str]:
+        """Send one command and return the lines pronsole prints in reply.
+
+        pronsole does not mark the end of a reply, so it ends when pronsole has
+        been quiet for 0.1 s, has printed nothing at all for 1 s, or after 5 s.
+        """
+        while not self.lines.empty():
+            self.lines.get()  # printed before this command: not part of its reply
+        self.send(command)
+        reply: list[str] = []
+        deadline = time.monotonic() + 5
+        try:
+            reply.append(self.lines.get(timeout=1))
             while time.monotonic() < deadline:
-                wait_for = 0.05
-                if quiet_deadline is not None:
-                    wait_for = min(wait_for, max(0, quiet_deadline - time.monotonic()))
-                    if wait_for == 0:
-                        break
-                try:
-                    lines.append(self.responses.get(timeout=wait_for))
-                    quiet_deadline = time.monotonic() + 0.1
-                except queue.Empty:
-                    if quiet_deadline is not None:
-                        break
-            return lines
+                reply.append(self.lines.get(timeout=0.1))
+        except queue.Empty:
+            pass
+        return reply
 
     def stop(self) -> None:
-        if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-        if self.log_handle is not None:
-            self.log_handle.close()
+        self.process.terminate()
+        self.process.wait()
 
 
-class DaemonServer:
-    def __init__(self, paths: RuntimePaths, port: str, baud: int, command: list[str]):
-        self.paths = paths
-        self.pronsole = PronsoleProcess(paths, port, baud, command)
-        self.server: socket.socket | None = None
-        self.stop_event = threading.Event()
+def notify_ready() -> None:
+    """Tell systemd (Type=notify) that clients can connect. Does nothing outside systemd."""
+    address = os.environ.get("NOTIFY_SOCKET")
+    if address:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify:
+            notify.sendto(b"READY=1", "\0" + address[1:] if address.startswith("@") else address)
 
-    def run(self) -> None:
-        self.paths.config_dir.mkdir(parents=True, exist_ok=True)
-        if self.paths.socket.exists():
-            try:
-                with socket.socket(socket.AF_UNIX) as probe:
-                    probe.connect(str(self.paths.socket))
-                raise DaemonError(f"daemon is already running ({self.paths.socket})")
-            except ConnectionRefusedError:
-                self.paths.socket.unlink()
 
+def listening(path: Path) -> bool:
+    with socket.socket(socket.AF_UNIX) as probe:
         try:
-            self.pronsole.start()
-            self_test = self.pronsole.self_test()
-            if self.pronsole.exited.is_set():
-                raise StartupError([self.pronsole.death_report()])
-            print("Startup command self-test:", flush=True)
-            for name, (passed, reason) in self_test.items():
-                label = "PASS" if passed else "FAIL"
-                print(f"  [{label}] {name}: {reason}", flush=True)
-            failures = [f"command '{name}' failed: {reason}" for name, (passed, reason) in self_test.items() if not passed]
-            if failures:
-                raise StartupError(failures)
-            self.paths.pid.write_text(f"{os.getpid()}\n", encoding="utf-8")
-            self.paths.setup.write_text(
-                json.dumps(
-                    {
-                        "port": self.pronsole.port,
-                        "baud": self.pronsole.baud,
-                        "pronsole": " ".join(self.pronsole.command),
-                        "pid": os.getpid(),
-                        "socket": str(self.paths.socket),
-                        "log": str(self.paths.log),
-                    },
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.server.bind(str(self.paths.socket))
-            os.chmod(self.paths.socket, SOCKET_MODE)
-            self.server.listen(8)
-            self.server.settimeout(0.5)
-            # Only now can clients connect: let `systemctl start` return.
-            sd_notify("READY=1")
-            print(f"Ready: listening on {self.paths.socket}", flush=True)
-            while not self.stop_event.is_set():
-                # Without pronsole every request would fail: exit so systemd restarts us.
-                if self.pronsole.exited.is_set():
-                    raise DaemonError(self.pronsole.death_report())
+            probe.connect(str(path))
+        except OSError:
+            return False
+        return True
+
+
+def answer(connection: socket.socket, pronsole: Pronsole) -> None:
+    """Read one request from a client, run it and send the reply."""
+    connection.settimeout(5)
+    try:
+        command = json.loads(connection.makefile().readline())["command"]
+        reply = {"ok": True, "output": pronsole.execute(command)}
+    except DaemonError as exc:
+        reply = {"ok": False, "error": str(exc)}
+    except (OSError, ValueError, LookupError, TypeError) as exc:
+        reply = {"ok": False, "error": f"bad request: {exc!r}"}
+    try:
+        connection.sendall(json.dumps(reply).encode() + b"\n")
+    except OSError:
+        pass  # the client has gone away
+
+
+def serve(directory: Path, port: str, baud: int) -> None:
+    """Run the daemon until interrupted. Raises DaemonError if pronsole or the printer fails."""
+    path = directory / SOCKET
+    directory.mkdir(parents=True, exist_ok=True)
+    if listening(path):
+        raise DaemonError(f"a daemon is already running on {path}")
+    path.unlink(missing_ok=True)  # left behind by a daemon that was killed
+
+    pronsole = Pronsole()
+    try:
+        pronsole.connect(port, baud)
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(path))
+            path.chmod(0o660)  # members of the daemon's group may connect
+            server.listen()
+            server.settimeout(0.5)
+            notify_ready()
+            print(f"Ready: listening on {path}", flush=True)
+            while True:
+                pronsole.check()  # exit when pronsole is of no use, so that systemd restarts us
                 try:
-                    connection, _ = self.server.accept()
+                    connection, _ = server.accept()
                 except socket.timeout:
                     continue
-                threading.Thread(
-                    target=self._handle_client, args=(connection,), daemon=True
-                ).start()
-        finally:
-            self.stop()
-
-    def _handle_client(self, connection: socket.socket) -> None:
-        with connection:
-            try:
-                request = json.loads(connection.makefile().readline())
-                output = self.pronsole.execute(request["command"])
-                payload = {"ok": True, "output": output}
-            except (DaemonError, KeyError, json.JSONDecodeError) as exc:
-                payload = {"ok": False, "error": str(exc)}
-            connection.sendall((json.dumps(payload) + "\n").encode())
-
-    def stop(self) -> None:
-        self.stop_event.set()
-        if self.server is not None:
-            self.server.close()
-        self.pronsole.stop()
-        for path in (self.paths.socket, self.paths.pid, self.paths.job):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+                with connection:
+                    answer(connection, pronsole)
+    finally:
+        pronsole.stop()
+        path.unlink(missing_ok=True)
 
 
-def send_request(paths: RuntimePaths, command: str) -> list[str]:
+def request(directory: Path, command: str) -> list[str]:
+    """Run one pronsole command through the daemon and return its reply lines."""
+    path = directory / SOCKET
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(5)
-            connection.connect(str(paths.socket))
-            connection.sendall((json.dumps({"command": command}) + "\n").encode())
-            response = json.loads(connection.makefile().readline())
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(30)
+            connection.connect(str(path))
+            connection.sendall(json.dumps({"command": command}).encode() + b"\n")
+            reply = json.loads(connection.makefile().readline())
+    except PermissionError as exc:
+        raise DaemonError(
+            f"permission denied on {path}. Add yourself to the pronsoled group "
+            "(`sudo usermod -aG pronsoled $USER`), then log out and back in."
+        ) from exc
     except (FileNotFoundError, ConnectionRefusedError) as exc:
         raise DaemonError(
-            f"daemon is not running: no socket at {paths.socket}. Start it with "
+            f"daemon is not running: no socket at {path}. Start it with "
             "`sudo systemctl start pronsoled` (if that fails, see `journalctl -u pronsoled`) "
             "or by hand with `pronsoled start`."
         ) from exc
-    except PermissionError as exc:
-        raise DaemonError(
-            f"permission denied on {paths.socket}. Add yourself to the pronsoled group "
-            "(`sudo usermod -aG pronsoled $USER`), then log out and back in."
-        ) from exc
-    except OSError as exc:
-        raise DaemonError(f"could not contact daemon at {paths.socket}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise DaemonError(f"invalid response from daemon at {paths.socket}") from exc
-    if not response.get("ok"):
-        raise DaemonError(response.get("error", "daemon rejected the command"))
-    return response.get("output", [])
+    except (ValueError, ConnectionError) as exc:
+        raise DaemonError(f"the daemon at {path} closed the connection without answering") from exc
+    if not reply["ok"]:
+        raise DaemonError(reply["error"])
+    return reply["output"]

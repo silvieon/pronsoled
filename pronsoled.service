@@ -3,8 +3,8 @@ Description=pronsoled - persistent Printrun pronsole daemon
 Documentation=https://github.com/silvieon/pronsoled
 
 [Service]
-# The daemon reports ready once its socket is listening, so `systemctl start`
-# returns only when `pronsoled status` works (or reports why it failed).
+# The daemon reports ready once the printer is online and its socket is listening,
+# so `systemctl start` returns when `pronsoled status` works, or fails with the reason.
 Type=notify
 # Unprivileged user created by install.sh, in the serial group for printer access.
 User=pronsoled
@@ -12,11 +12,9 @@ User=pronsoled
 # setgid, so print jobs they stage there stay readable by the daemon.
 RuntimeDirectory=pronsoled
 RuntimeDirectoryMode=2770
-StateDirectory=pronsoled
-LogsDirectory=pronsoled
 Environment=PRONSOLED_CONFIG_DIR=/run/pronsoled
-ExecStart=/usr/local/bin/pronsoled start auto 115200 --log-file /var/log/pronsoled/pronsoled.log
-# Keep retrying, e.g. until the printer is plugged in.
+ExecStart=/usr/local/bin/pronsoled start auto 115200
+# Keep retrying, e.g. until the printer is plugged in or switched back on.
 Restart=on-failure
 RestartSec=10
 # SIGTERM goes to pronsoled only; it stops pronsole itself.

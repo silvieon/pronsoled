@@ -1,21 +1,11 @@
-# Python
 __pycache__/
 *.pyc
-*.egg-info/
-build/
-dist/
 .venv/
-
-# Runtime artifacts
-*.log
-*.pid
-*.sock
 
 # Editors / OS
 .vscode/
 .idea/
 *.swp
 *~
-.~lock.*#
 .DS_Store
 Thumbs.db

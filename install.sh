@@ -1,8 +1,8 @@
 #!/bin/sh
 # Install pronsoled as a systemd service whose commands need no sudo.
 #
-#   sudo ./install.sh              install or upgrade
-#   sudo ./install.sh --uninstall  remove
+#   sudo ./install.sh              install or upgrade, then (re)start the service
+#   sudo ./install.sh --uninstall  remove everything this script installed
 set -eu
 umask 022  # the service user must be able to read what root installs
 
@@ -19,12 +19,14 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 case "${1:-}" in
-    "" | --with-printrun) ;;  # Printrun is always installed now; old flag still accepted
+    "") ;;
     --uninstall)
         systemctl disable --now pronsoled 2>/dev/null || true
-        rm -rf "$UNIT" "$BIN" /opt/pronsoled
+        rm -rf "$UNIT" "$BIN" /opt/pronsoled /var/lib/pronsoled
         systemctl daemon-reload
-        echo "Removed pronsoled. Kept the 'pronsoled' user, /var/lib/pronsoled and /var/log/pronsoled."
+        userdel pronsoled 2>/dev/null || true
+        groupdel pronsoled 2>/dev/null || true
+        echo "Removed pronsoled."
         exit 0
         ;;
     *)
@@ -42,53 +44,57 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# A fresh, isolated venv: nothing installed elsewhere on the system can interfere.
-echo "Installing pronsoled into $VENV..."
-python3 -m venv --clear "$VENV"
-mkdir "$TMP/src"
-cp -r "$SRC/pyproject.toml" "$SRC/pronsoled" "$TMP/src/"  # build outside the checkout
-"$VENV/bin/pip" install --quiet "$TMP/src" pyserial platformdirs
-ln -sf "$VENV/bin/pronsoled" "$BIN"
-
 # Printrun's pronsole, as plain Python source. Installing it with pip would need
 # a C compiler on newer Pythons (PyPI has no prebuilt package for them) and pull
 # in wxPython; pronsole needs neither (see pronsoled/_pronsole.py).
-echo "Installing $PRINTRUN..."
-"$VENV/bin/python" -c 'import sys, urllib.request; urllib.request.urlretrieve(*sys.argv[1:])' \
+echo "Downloading $PRINTRUN..."
+python3 -c 'import sys, urllib.request; urllib.request.urlretrieve(*sys.argv[1:])' \
     "https://files.pythonhosted.org/packages/source/p/printrun/$PRINTRUN.tar.gz" "$TMP/$PRINTRUN.tar.gz"
 echo "$PRINTRUN_SHA256  $TMP/$PRINTRUN.tar.gz" | sha256sum --check --quiet
 tar -xzf "$TMP/$PRINTRUN.tar.gz" -C "$TMP"
-SITE=$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
-cp -r "$TMP/$PRINTRUN/printrun" "$SITE/"
-"$VENV/bin/python" -W ignore -m compileall -q "$SITE/printrun" || true
 
-# The service user, with access to serial ports (group uucp on Arch).
+# A fresh, isolated environment: nothing installed elsewhere on the system can interfere.
+echo "Installing into $VENV..."
+python3 -m venv --clear "$VENV"
+"$VENV/bin/pip" install --quiet pyserial platformdirs
+SITE=$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+cp -r "$SRC/pronsoled" "$TMP/$PRINTRUN/printrun" "$SITE/"
+"$VENV/bin/python" -W ignore -m compileall -q "$SITE/pronsoled" "$SITE/printrun" || true
+# -I: ignore the working directory and the caller's Python settings.
+printf '#!/bin/sh\nexec %s/bin/python -I -m pronsoled.cli "$@"\n' "$VENV" >"$BIN"
+chmod 755 "$BIN"
+
+# The service user, with access to serial ports (group uucp on Arch), and the
+# group that may use the socket.
 getent group pronsoled >/dev/null || groupadd --system pronsoled
 id pronsoled >/dev/null 2>&1 ||
     useradd --system --gid pronsoled --home-dir /var/lib/pronsoled --shell /usr/sbin/nologin pronsoled
 install -d -o pronsoled -g pronsoled -m 750 /var/lib/pronsoled
 for group in dialout uucp; do
-    if getent group "$group" >/dev/null; then usermod -aG "$group" pronsoled; fi
+    ! getent group "$group" >/dev/null || usermod -aG "$group" pronsoled
 done
+[ -z "${SUDO_USER:-}" ] || usermod -aG pronsoled "$SUDO_USER"
 
-install -m 644 "$SRC/pronsoled.service" "$UNIT"
-systemctl daemon-reload
-
-# Prove that pronsole starts as the service user before reporting success.
+# Prove that pronsole starts as the service user: the service itself may fail
+# to start for an innocent reason, such as no printer being connected.
 if ! (cd / && runuser -u pronsoled -- env HOME=/var/lib/pronsoled \
-        "$VENV/bin/python" -m pronsoled._pronsole) </dev/null >"$TMP/check.log" 2>&1; then
+        "$VENV/bin/python" "$SITE/pronsoled/_pronsole.py") </dev/null >"$TMP/check.log" 2>&1; then
     cat "$TMP/check.log" >&2
     echo "ERROR: pronsole does not start as the 'pronsoled' user (see above)." >&2
     exit 1
 fi
 
+install -m 644 "$SRC/pronsoled.service" "$UNIT"
+systemctl daemon-reload
+systemctl enable --quiet pronsoled
 echo ""
-echo "Installed. Start the daemon now and at every boot with:"
-echo "  sudo systemctl enable --now pronsoled"
-echo "(after an upgrade: sudo systemctl restart pronsoled)"
+if systemctl restart pronsoled; then
+    echo "pronsoled is installed and running."
+else
+    echo "pronsoled is installed but could not start: is the printer connected and switched on?"
+    echo "It retries every 10 seconds. To see why it fails: journalctl -u pronsoled -n 20"
+fi
 if [ -n "${SUDO_USER:-}" ]; then
-    usermod -aG pronsoled "$SUDO_USER"
-    echo ""
-    echo "Added '$SUDO_USER' to the 'pronsoled' group. Log out and back in, then run"
+    echo "'$SUDO_USER' is now in the 'pronsoled' group. Log out and back in, then use"
     echo "pronsoled without sudo, for example: pronsoled status"
 fi

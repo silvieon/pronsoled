@@ -1,3 +1,3 @@
-"""A small, local daemon for a persistent pronsole connection."""
+"""One persistent pronsole process, shared through a Unix socket."""
 
-__version__ = "0.1.6"
+__version__ = "0.2.0"
