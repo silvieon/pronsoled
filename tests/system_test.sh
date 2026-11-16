@@ -117,7 +117,11 @@ cleanup() {
     rm -rf "$DROPIN" "$PORT" "$WORK"
     systemctl daemon-reload
     for user in "$MEMBER" "$COLLEAGUE" "$OUTSIDER"; do
-        userdel --remove "$user" 2>/dev/null
+        id "$user" >/dev/null 2>&1 || continue
+        # `runuser -l` starts a systemd user session, which outlives the command.
+        systemctl stop "user@$(id -u "$user").service" 2>/dev/null
+        pkill -KILL -u "$user"
+        userdel --remove "$user" 2>/dev/null || echo "WARNING: could not remove the test user $user" >&2
     done
 }
 trap cleanup EXIT
