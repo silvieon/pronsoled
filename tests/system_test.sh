@@ -69,12 +69,17 @@ as() {  # as USER SHELL-COMMAND: runs it in a fresh login of that user, who has 
     runuser -l "$1" -c "$2"
 }
 
+mark() {  # journal checks after this see only what is logged from now on
+    MARK=$(date '+%Y-%m-%d %H:%M:%S')
+    sleep 1
+}
+
 journal() {
-    journalctl -u pronsoled --no-pager -o cat
+    journalctl -u pronsoled --no-pager -o cat --since "$MARK"
 }
 
 printer_log() {
-    journalctl -u pronsoled-test-printer --no-pager -o cat
+    journalctl -u pronsoled-test-printer --no-pager -o cat --since "$MARK"
 }
 
 start_printer() {
@@ -91,7 +96,7 @@ stopped_cleanly() {
 }
 
 no_process() {
-    ! pgrep -f '[p]ronsoled.cli|[_]pronsole.py'
+    ! pgrep -f '^/opt/pronsoled/'
 }
 
 run_tests() {  # run_tests PYTHON: the unit tests, as an ordinary user
@@ -137,6 +142,7 @@ echo "== Unit tests before installing"
 check "the tests pass with the system Python and the fake Printrun" run_tests python3
 
 echo "== Installing"
+mark
 check "install.sh shows its usage for an unknown option" says "sudo ./install.sh --uninstall" ./install.sh --bogus
 check "...and fails" fails ./install.sh --bogus
 check "install.sh succeeds" env SUDO_USER="$MEMBER" ./install.sh
@@ -197,11 +203,13 @@ check "...and no process" no_process
 check "...and no socket directory" test ! -e /run/pronsoled
 
 systemctl start pronsoled
+mark
 pkill -9 -u pronsoled -f _pronsole.py
 check "when pronsole is killed, the daemon exits and says why" \
     eventually 10 says "pronsole exited unexpectedly with code -9" journal
 check "...and systemd restarts it" eventually 30 as "$MEMBER" "pronsoled status"
 
+mark
 systemctl stop pronsoled-test-printer
 check "when the printer is unplugged, the daemon exits and says why" eventually 10 says "lost the printer" journal
 check "...and systemctl start fails while the printer is away" fails systemctl start pronsoled
